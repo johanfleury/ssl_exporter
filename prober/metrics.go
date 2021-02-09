@@ -1,10 +1,12 @@
 package prober
 
 import (
+	"bytes"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
 	"io/ioutil"
+	"net/http"
 	"sort"
 	"strconv"
 	"strings"
@@ -33,7 +35,11 @@ func collectConnectionStateMetrics(state tls.ConnectionState, registry *promethe
 		return err
 	}
 
-	return collectOCSPMetrics(state.OCSPResponse, registry)
+	if err := collectOCSPMetrics(state.OCSPResponse, registry); err != nil {
+		return err
+	}
+
+	return collectRevocationMetrics(state.VerifiedChains, registry)
 }
 
 func collectTLSVersionMetrics(version uint16, registry *prometheus.Registry) error {
@@ -229,6 +235,52 @@ func collectOCSPMetrics(ocspResponse []byte, registry *prometheus.Registry) erro
 	return nil
 }
 
+func collectRevocationMetrics(verifiedChains [][]*x509.Certificate, registry *prometheus.Registry) error {
+	revocationStatus := prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: prometheus.BuildFQName(namespace, "", "revocation_status"),
+			Help: "OCSP or CRL revocation status for the certificate (0=Good 1=Revoked 2=Unknown)",
+		},
+		[]string{"chain_no", "serial_no", "issuer_cn", "cn", "dnsnames", "ips", "emails", "ou"},
+	)
+
+	registry.MustRegister(revocationStatus)
+
+	for i, chain := range verifiedChains {
+		log.Debugf("Checking chain #%d", i)
+
+		for j, cert := range chain {
+			log.Debugf("Checking certitifcate %s", cert.Subject)
+
+			if j+1 >= len(chain) {
+				log.Infof("Skiping cert %s: has no issuers (must be the root CA)", cert.Subject)
+				continue
+			}
+
+			issuer := chain[j+1]
+
+			status := 2
+
+			if len(cert.OCSPServer) >= 1 {
+				log.Debugf("Checking OCSP status")
+				status = checkOCSPStatus(cert, issuer)
+			}
+
+			if status == 2 {
+				log.Debugf("Falling back to CRL checking")
+				status = checkCRLStatus(cert, issuer)
+			}
+
+			chainNo := strconv.Itoa(i)
+			labels := append([]string{chainNo}, labelValues(cert)...)
+
+			revocationStatus.WithLabelValues(labels...).Set(float64(status))
+		}
+	}
+
+	return nil
+}
+
 func collectFileMetrics(files []string, registry *prometheus.Registry) error {
 	var (
 		totalCerts   []*x509.Certificate
@@ -378,4 +430,98 @@ func organizationalUnits(cert *x509.Certificate) string {
 	}
 
 	return ""
+}
+
+func checkOCSPStatus(cert *x509.Certificate, issuer *x509.Certificate) int {
+	log.Debugf("Building an OCSP request for %s with issuer %s", cert.Subject, issuer.Subject)
+	req, err := ocsp.CreateRequest(cert, issuer, &ocsp.RequestOptions{})
+	if err != nil {
+		log.Warnf("Unable to create OCSP request for %s: %s", cert.Subject, err)
+		return 2
+	}
+
+	for _, server := range cert.OCSPServer {
+		log.Debugf("Requesting OCSP status for %s on %s", cert.Subject, server)
+		resp, err := OCSPRequest(server, req, issuer)
+		if err != nil {
+			log.Warnf("Unable to check OCSP status for %s: %s", cert.Subject, err)
+			continue
+		}
+
+		return resp.Status
+	}
+
+	return 2
+}
+
+func checkCRLStatus(cert *x509.Certificate, issuer *x509.Certificate) int {
+	for _, url := range cert.CRLDistributionPoints {
+		resp, err := http.Get(url)
+		if err != nil {
+			log.Warnf("Unable to download CRL for %s: %s", cert.Subject, err)
+			continue
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			log.Warnf("Unable to downlaod CRL for %s: got HTTP status code %d", cert.Subject, resp.StatusCode)
+			continue
+		}
+
+		data, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			log.Warnf("Unable to read CRL from HTTP response for %s: %s", cert.Subject, err)
+			continue
+		}
+
+		crl, err := x509.ParseCRL(data)
+		if err != nil {
+			log.Warnf("Unable to parse CRL for %s: %s", cert.Subject, err)
+			continue
+		}
+
+		if err := issuer.CheckCRLSignature(crl); err != nil {
+			log.Warnf("Unable to check CRL signature for %s: %s", cert.Subject, err)
+			continue
+		}
+
+		for _, revokedCert := range crl.TBSCertList.RevokedCertificates {
+			if cert.SerialNumber == revokedCert.SerialNumber {
+				return 1
+			}
+		}
+
+		return 0
+	}
+
+	return 2
+}
+
+func OCSPRequest(server string, req []byte, issuer *x509.Certificate) (*ocsp.Response, error) {
+	var err error
+	var resp *http.Response
+
+	buf := bytes.NewBuffer(req)
+	resp, err = http.Post(server, "application/ocsp-request", buf)
+
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("http error")
+	}
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("no data")
+	}
+	resp.Body.Close()
+
+	ocspResponse, err := ocsp.ParseResponse(body, issuer)
+	if err != nil {
+		return nil, err
+	}
+
+	return ocspResponse, nil
 }
